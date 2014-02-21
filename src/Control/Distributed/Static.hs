@@ -8,41 +8,6 @@
 -- all distributed nodes are using the same 'RemoteTable'). In this module
 -- we implement this mimickry and various extensions.
 --
--- [Compositionality]
---
--- Static values as described in the paper are not compositional: there is no
--- way to combine two static values and get a static value out of it. This
--- makes sense when interpreting static strictly as /known at compile time/,
--- but it severely limits expressiveness. However, the main motivation for
--- 'static' is not that they are known at compile time but rather that
--- /they provide a free/ 'Binary' /instance/.  We therefore provide two basic
--- constructors for 'Static' values:
---
--- > staticLabel :: String -> Static a
--- > staticApply :: Static (a -> b) -> Static a -> Static b
---
--- The first constructor refers to a label in a 'RemoteTable'. The second
--- allows to apply a static function to a static argument, and makes 'Static'
--- compositional: once we have 'staticApply' we can implement numerous derived
--- combinators on 'Static' values (we define a few in this module; see
--- 'staticCompose', 'staticSplit', and 'staticConst').
---
--- [Closures]
---
--- Closures in functional programming arise when we partially apply a function.
--- A closure is a code pointer together with a runtime data structure that
--- represents the value of the free variables of the function. A 'Closure'
--- represents these closures explicitly so that they can be serialized:
---
--- > data Closure a = Closure (Static (ByteString -> a)) ByteString
---
--- See /Towards Haskell in the Cloud/ for the rationale behind representing
--- the function closure environment in serialized ('ByteString') form. Any
--- static value can trivially be turned into a 'Closure' ('staticClosure').
--- Moreover, since 'Static' is now compositional, we can also define derived
--- operators on 'Closure' values ('closureApplyStatic', 'closureApply',
--- 'closureCompose', 'closureSplit').
---
 -- [Monomorphic example]
 --
 -- Suppose we are working in the context of some distributed environment, with
@@ -119,27 +84,24 @@
 -- we somehow need to include the 'Binary' instance in the closure -- after
 -- all, we can ship this closure someplace else, where it needs to accept an
 -- 'a', /then encode it/, and send it off. In order to do this, we need to turn
--- the Binary instance into an explicit dictionary:
+-- the Binary instance into an explicit dictionary (in GHC >= 7.8):
 --
--- > data BinaryDict a where
--- >   BinaryDict :: Binary a => BinaryDict a
--- >
--- > sendDict :: BinaryDict a -> ProcessId -> a -> Process ()
--- > sendDict BinaryDict = send
+-- > sendDict :: Dict (Binary a) -> ProcessId -> a -> Process ()
+-- > sendDict Dict = send
 --
 -- Now 'sendDict' is a normal polymorphic value:
 --
--- > sendDictStatic :: Static (BinaryDict a -> ProcessId -> a -> Process ())
+-- > sendDictStatic :: Static (Dict (Binary a)) -> ProcessId -> a -> Process ())
 -- > sendDictStatic = staticLabel "$sendDict"
 -- >
 -- > rtable :: RemoteTable
 -- > rtable = ...
--- >        . registerStatic "$sendDict" (sendDict :: BinaryDict ANY -> ProcessId -> ANY -> Process ())
+-- >        . registerStatic "$sendDict" (sendDict :: Dict (Binary ANY) -> ProcessId -> ANY -> Process ())
 -- >        $ initRemoteTable
 --
 -- so that we can define
 --
--- > sendClosure :: Static (BinaryDict a) -> Process a -> Closure (a -> Process ())
+-- > sendClosure :: Static (Dict (Binary a)) -> ProcessId -> Closure (a -> Process ())
 -- > sendClosure dict pid = closure decoder (encode pid)
 -- >   where
 -- >     decoder :: Static (ByteString -> a -> Process ())
@@ -154,29 +116,39 @@
 -- > rtable = registerStatic "$sdictSendPort" sdictSendPort
 -- >        $ initRemoteTable
 -- >   where
--- >     sdictSendPort :: SerializableDict ANY -> SerializableDict (SendPort ANY)
--- >     sdictSendPort SerializableDict = SerializableDict
+-- >     sdictSendPort :: Dict (Serializable ANY) -> Dict (Serializable (SendPort ANY))
+-- >     sdictSendPort Dict = Dict
 --
 -- This definition of 'sdictSendPort' ignores its argument completely, and
--- constructs a 'SerializableDict' for the /monomorphic/ type @SendPort ANY@,
--- which isn't what you want. Instead, you should do
+-- constructs a 'Dict' for the /monomorphic/ type @SendPort ANY@, which isn't
+-- what you want. Instead, you should do
 --
 -- > rtable :: RemoteTable
--- > rtable = registerStatic "$sdictSendPort" (sdictSendPort :: SerializableDict ANY -> SerializableDict (SendPort ANY))
+-- > rtable = registerStatic "$sdictSendPort" (sdictSendPort :: Dict (Serializable ANY)
+-- >                                                         -> Dict (Serializable (SendPort ANY)))
 -- >        $ initRemoteTable
 -- >   where
--- >     sdictSendPort :: forall a. SerializableDict a -> SerializableDict (SendPort a)
--- >     sdictSendPort SerializableDict = SerializableDict
+-- >     sdictSendPort :: forall a. Dict (Serializable a)
+-- >                   -> Dict (Serializable (SendPort a))
+-- >     sdictSendPort Dict = Dict
 module Control.Distributed.Static
   ( -- * Static values
     Static
+  , Dict(..)
   , staticLabel
   , staticApply
     -- * Derived static combinators
-  , staticCompose
-  , staticSplit
   , staticConst
   , staticFlip
+  , staticId
+  , staticCompose
+  , staticFirst
+  , staticSecond
+  , staticSplit
+  , staticFanout
+  , staticApp
+  , staticEncode
+  , staticDecode
     -- * Closures
   , Closure
   , closure
@@ -194,21 +166,20 @@ module Control.Distributed.Static
   , unclosure
   ) where
 
+import qualified Control.Distributed.Static.Generic as G
+import Control.Distributed.Static.Generic (Dict(..))
 import Data.Binary
   ( Binary(get, put)
-  , Put
-  , Get
-  , putWord8
-  , getWord8
   , encode
   , decode
   )
-import Data.ByteString.Lazy (ByteString, empty)
+import Data.ByteString.Lazy (ByteString)
 import Data.Map (Map)
 import qualified Data.Map as Map (lookup, empty, insert)
-import Control.Applicative ((<$>), (<*>))
-import Control.Arrow as Arrow ((***), app)
-import Data.Rank1Dynamic (Dynamic, toDynamic, fromDynamic, dynApply)
+import Control.Applicative ((<$>))
+import Control.Arrow as Arrow (Arrow(..), ArrowApply(..))
+import Data.Functor.Identity (Identity(..))
+import Data.Rank1Dynamic (Dynamic, toDynamic)
 import Data.Rank1Typeable
   ( Typeable
   , ANY1
@@ -221,44 +192,26 @@ import Data.Rank1Typeable
 -- Introducing static values                                                  --
 --------------------------------------------------------------------------------
 
-data StaticLabel =
-    StaticLabel String
-  | StaticApply StaticLabel StaticLabel
+newtype StaticLabel = StaticLabel String
   deriving (Typeable, Show)
 
--- | A static value. Static is opaque; see 'staticLabel' and 'staticApply'.
-newtype Static a = Static StaticLabel
-  deriving (Typeable, Show)
+-- | A static value.
+type Static = G.Static StaticLabel
 
-instance Binary (Static a) where
-  put (Static label) = putStaticLabel label
-  get = Static <$> getStaticLabel
-
--- We don't want StaticLabel to be its own Binary instance
-putStaticLabel :: StaticLabel -> Put
-putStaticLabel (StaticLabel string) =
-  putWord8 0 >> put string
-putStaticLabel (StaticApply label1 label2) =
-  putWord8 1 >> putStaticLabel label1 >> putStaticLabel label2
-
-getStaticLabel :: Get StaticLabel
-getStaticLabel = do
-  header <- getWord8
-  case header of
-    0 -> StaticLabel <$> get
-    1 -> StaticApply <$> getStaticLabel <*> getStaticLabel
-    _ -> fail "StaticLabel.get: invalid"
+instance Binary StaticLabel where
+  put (StaticLabel label) = put label
+  get = StaticLabel <$> get
 
 -- | Create a primitive static value.
 --
 -- It is the responsibility of the client code to make sure the corresponding
 -- entry in the 'RemoteTable' has the appropriate type.
 staticLabel :: String -> Static a
-staticLabel = Static . StaticLabel
+staticLabel = G.staticLabel . StaticLabel
 
--- | Apply two static values
+-- | Apply a static value to another.
 staticApply :: Static (a -> b) -> Static a -> Static b
-staticApply (Static f) (Static x) = Static (StaticApply f x)
+staticApply = G.staticApply
 
 --------------------------------------------------------------------------------
 -- Eliminating static values                                                  --
@@ -267,151 +220,180 @@ staticApply (Static f) (Static x) = Static (StaticApply f x)
 -- | Runtime dictionary for 'unstatic' lookups
 newtype RemoteTable = RemoteTable (Map String Dynamic)
 
+--------------------------------------------------------------------------------
+-- Predefined static labels                                                   --
+--------------------------------------------------------------------------------
+
+instance G.PreludeLabel StaticLabel where
+  constLabel   = StaticLabel "$const"
+  flipLabel    = StaticLabel "$flip"
+
+instance G.CategoryLabel StaticLabel where
+  idLabel      = StaticLabel "$id"
+  composeLabel = StaticLabel "$compose"
+
+instance G.ArrowLabel StaticLabel where
+  firstLabel   = StaticLabel "$first"
+  secondLabel  = StaticLabel "$second"
+  splitLabel   = StaticLabel "$split"
+  fanoutLabel  = StaticLabel "$fanout"
+
+instance G.ArrowApplyLabel StaticLabel where
+  appLabel     = StaticLabel "$app"
+
+instance G.BinaryLabel StaticLabel where
+  binaryDictEncodeLabel     = StaticLabel "$encode"
+  binaryDictDecodeLabel     = StaticLabel "$decode"
+  byteStringBinaryDictLabel = StaticLabel "$byteStringDict"
+  pairBinaryDictLabel       = StaticLabel "$pairDict"
+
 -- | Initial remote table
 initRemoteTable :: RemoteTable
 initRemoteTable =
-      registerStatic "$compose"       (toDynamic ((.)    :: (ANY2 -> ANY3) -> (ANY1 -> ANY2) -> ANY1 -> ANY3))
-    . registerStatic "$const"         (toDynamic (const  :: ANY1 -> ANY2 -> ANY1))
-    . registerStatic "$split"         (toDynamic ((***)  :: (ANY1 -> ANY3) -> (ANY2 -> ANY4) -> (ANY1, ANY2) -> (ANY3, ANY4)))
-    . registerStatic "$app"           (toDynamic (app    :: (ANY1 -> ANY2, ANY1) -> ANY2))
-    . registerStatic "$decodeEnvPair" (toDynamic (decode :: ByteString -> (ByteString, ByteString)))
-    . registerStatic "$flip"          (toDynamic (flip   :: (ANY1 -> ANY2 -> ANY3) -> ANY2 -> ANY1 -> ANY3))
+      registerStatic "$const"          (toDynamic (const  :: ANY1 -> ANY2 -> ANY1))
+    . registerStatic "$flip"           (toDynamic (flip   :: (ANY1 -> ANY2 -> ANY3)
+                                                          -> (ANY2 -> ANY1 -> ANY3)))
+    . registerStatic "$id"             (toDynamic (id     :: ANY1 -> ANY1))
+    . registerStatic "$compose"        (toDynamic ((.)    :: (ANY2 -> ANY3)
+                                                          -> (ANY1 -> ANY2)
+                                                          -> (ANY1 -> ANY3)))
+    . registerStatic "$first"          (toDynamic (first  :: (ANY1 -> ANY2)
+                                                          -> (ANY1, ANY3)
+                                                          -> (ANY2, ANY3)))
+    . registerStatic "$second"         (toDynamic (second :: (ANY1 -> ANY2)
+                                                          -> (ANY3, ANY1)
+                                                          -> (ANY3, ANY2)))
+    . registerStatic "$split"          (toDynamic ((***)  :: (ANY1 -> ANY3)
+                                                          -> (ANY2 -> ANY4)
+                                                          -> (ANY1, ANY2)
+                                                          -> (ANY3, ANY4)))
+    . registerStatic "$fanout"         (toDynamic ((&&&)  :: (ANY1 -> ANY2)
+                                                          -> (ANY1 -> ANY3)
+                                                          -> (ANY1 -> (ANY2, ANY3))))
+    . registerStatic "$app"            (toDynamic (app    :: (ANY1 -> ANY2, ANY1)
+                                                          -> ANY2))
+    . registerStatic "$encode"         (toDynamic ((\Dict -> encode)
+                                                   :: Dict (Binary ANY1)
+                                                   -> ANY1
+                                                   -> ByteString))
+    . registerStatic "$decode"         (toDynamic ((\Dict -> decode)
+                                                   :: Dict (Binary ANY1)
+                                                   -> ByteString
+                                                   -> ANY1))
+    . registerStatic "$byteStringDict" (toDynamic (Dict :: Dict (Binary ByteString)))
+    . registerStatic "$pairDict"       (toDynamic ((\Dict Dict -> Dict)
+                                                   :: Dict (Binary ANY1)
+                                                   -> Dict (Binary ANY2)
+                                                   -> Dict (Binary (ANY1, ANY2))))
     $ RemoteTable Map.empty
 
 -- | Register a static label
 registerStatic :: String -> Dynamic -> RemoteTable -> RemoteTable
-registerStatic label dyn (RemoteTable rtable)
-  = RemoteTable (Map.insert label dyn rtable)
+registerStatic label dyn (RemoteTable rtable) =
+    RemoteTable (Map.insert label dyn rtable)
 
--- Pseudo-type: RemoteTable -> Static a -> a
-resolveStaticLabel :: RemoteTable -> StaticLabel -> Either String Dynamic
-resolveStaticLabel (RemoteTable rtable) (StaticLabel label) =
-  case Map.lookup label rtable of
-    Nothing -> Left $ "Invalid static label '" ++ label ++ "'"
-    Just d  -> Right d
-resolveStaticLabel rtable (StaticApply label1 label2) = do
-  f <- resolveStaticLabel rtable label1
-  x <- resolveStaticLabel rtable label2
-  f `dynApply` x
+instance G.Resolve StaticLabel Identity RemoteTable where
+  resolve (RemoteTable rtable) (StaticLabel label) =
+      case Map.lookup label rtable of
+        Nothing -> return $ Left $ "Invalid static label '" ++ label ++ "'"
+        Just d  -> return $ Right d
 
--- | Resolve a static value
+-- | Resolve a static value.
 unstatic :: Typeable a => RemoteTable -> Static a -> Either String a
-unstatic rtable (Static static) = do
-  dyn <- resolveStaticLabel rtable static
-  fromDynamic dyn
-
---------------------------------------------------------------------------------
--- Closures                                                                   --
---------------------------------------------------------------------------------
-
--- | A closure is a static value and an encoded environment
-data Closure a = Closure (Static (ByteString -> a)) ByteString
-  deriving (Typeable, Show)
-
-instance Binary (Closure a) where
-  put (Closure static env) = put static >> put env
-  get = Closure <$> get <*> get
-
-closure :: Static (ByteString -> a) -- ^ Decoder
-        -> ByteString               -- ^ Encoded closure environment
-        -> Closure a
-closure = Closure
-
--- | Resolve a closure
-unclosure :: Typeable a => RemoteTable -> Closure a -> Either String a
-unclosure rtable (Closure static env) = do
-  f <- unstatic rtable static
-  return (f env)
-
--- | Convert a static value into a closure.
-staticClosure :: Typeable a => Static a -> Closure a
-staticClosure static = closure (staticConst static) empty
-
---------------------------------------------------------------------------------
--- Predefined static values                                                   --
---------------------------------------------------------------------------------
-
--- | Static version of ('Prelude..')
-composeStatic :: (Typeable a, Typeable b, Typeable c)
-              => Static ((b -> c) -> (a -> b) -> a -> c)
-composeStatic = staticLabel "$compose"
-
--- | Static version of 'const'
-constStatic :: (Typeable a, Typeable b)
-            => Static (a -> b -> a)
-constStatic = staticLabel "$const"
-
--- | Static version of ('Arrow.***')
-splitStatic :: (Typeable a, Typeable a', Typeable b, Typeable b')
-            => Static ((a -> b) -> (a' -> b') -> (a, a') -> (b, b'))
-splitStatic = staticLabel "$split"
-
--- | Static version of 'Arrow.app'
-appStatic :: (Typeable a, Typeable b)
-          => Static ((a -> b, a) -> b)
-appStatic = staticLabel "$app"
-
--- | Static version of 'flip'
-flipStatic :: (Typeable a, Typeable b, Typeable c)
-           => Static ((a -> b -> c) -> b -> a -> c)
-flipStatic = staticLabel "$flip"
+unstatic rtable static = runIdentity $ G.unstatic rtable static
 
 --------------------------------------------------------------------------------
 -- Combinators on static values                                               --
 --------------------------------------------------------------------------------
 
--- | Static version of ('Prelude..')
-staticCompose :: (Typeable a, Typeable b, Typeable c)
-              => Static (b -> c) -> Static (a -> b) -> Static (a -> c)
-staticCompose g f = composeStatic `staticApply` g `staticApply` f
+-- | Static version of 'Prelude.const'.
+staticConst :: Static (a -> b -> a)
+staticConst = G.staticConst
 
--- | Static version of ('Control.Arrow.***')
-staticSplit :: (Typeable a, Typeable a', Typeable b, Typeable b')
-            => Static (a -> b) -> Static (a' -> b') -> Static ((a, a') -> (b, b'))
-staticSplit f g = splitStatic `staticApply` f `staticApply` g
+-- | Static version of 'Prelude.flip'.
+staticFlip :: Static (a -> b -> c)
+           -> Static (b -> a -> c)
+staticFlip = G.staticFlip
 
--- | Static version of 'Prelude.const'
-staticConst :: (Typeable a, Typeable b)
-            => Static a -> Static (b -> a)
-staticConst x = constStatic `staticApply` x
+-- | Static version of ('Control.Category.id').
+staticId :: Static (a -> a)
+staticId = G.staticId
 
--- | Static version of 'Prelude.flip'
-staticFlip :: (Typeable a, Typeable b, Typeable c)
-           => Static (a -> b -> c) -> Static (b -> a -> c)
-staticFlip f = flipStatic `staticApply` f
+-- | Static version of ('Control.Category..')
+staticCompose :: Static (b -> c)
+              -> Static (a -> b)
+              -> Static (a -> c)
+staticCompose = G.staticCompose
+
+-- | Static version of ('Control.Arrow.first').
+staticFirst :: Static (b -> c) -> Static ((b, d) -> (c, d))
+staticFirst = G.staticFirst
+
+-- | Static version of ('Control.Arrow.second').
+staticSecond :: Static (b -> c) -> Static ((d, b) -> (d, c))
+staticSecond = G.staticSecond
+
+-- | Static version of ('Control.Arrow.***').
+staticSplit :: Static (b -> c)
+            -> Static (b' -> c')
+            -> Static ((b, b') -> (c, c'))
+staticSplit = G.staticSplit
+
+-- | Static version of ('Control.Arrow.&&&').
+staticFanout :: Static (b -> c)
+             -> Static (b -> c')
+             -> Static (b -> (c, c'))
+staticFanout = G.staticFanout
+
+-- | Static version of ('Control.Arrow.app').
+staticApp :: Static ((b -> c, b) -> c)
+staticApp = G.staticApp
+
+staticEncode :: Static (Dict (Binary a))
+             -> Static (a -> ByteString)
+staticEncode = G.staticEncode
+
+staticDecode :: Static (Dict (Binary a))
+             -> Static (ByteString -> a)
+staticDecode = G.staticDecode
+
+--------------------------------------------------------------------------------
+-- Closures                                                                   --
+--------------------------------------------------------------------------------
+
+type Closure = G.Closure StaticLabel
+
+closure :: Static (ByteString -> a) -- ^ Decoder
+        -> ByteString               -- ^ Encoded closure environment
+        -> Closure a
+closure = G.closure
+
+-- | Resolve a closure.
+unclosure :: Typeable a => RemoteTable -> Closure a -> Either String a
+unclosure rtable clos = runIdentity $ G.unclosure rtable clos
+
+-- | Convert a static value into a closure.
+staticClosure :: Typeable a => Static a -> Closure a
+staticClosure = G.staticClosure
 
 --------------------------------------------------------------------------------
 -- Combinators on Closures                                                    --
 --------------------------------------------------------------------------------
 
--- | Apply a static function to a closure
-closureApplyStatic :: (Typeable a, Typeable b)
-                   => Static (a -> b) -> Closure a -> Closure b
-closureApplyStatic f (Closure decoder env) =
-  closure (f `staticCompose` decoder) env
+-- | Apply a static function to a closure.
+closureApplyStatic :: Static (a -> b) -> Closure a -> Closure b
+closureApplyStatic = G.closureApplyStatic
 
-decodeEnvPairStatic :: Static (ByteString -> (ByteString, ByteString))
-decodeEnvPairStatic = staticLabel "$decodeEnvPair"
+-- | Closure application.
+closureApply :: Closure (a -> b) -> Closure a -> Closure b
+closureApply = G.closureApply
 
--- | Closure application
-closureApply :: forall a b. (Typeable a, Typeable b)
-             => Closure (a -> b) -> Closure a -> Closure b
-closureApply (Closure fdec fenv) (Closure xdec xenv) =
-    closure decoder (encode (fenv, xenv))
-  where
-    decoder :: Static (ByteString -> b)
-    decoder = appStatic
-            `staticCompose`
-              (fdec `staticSplit` xdec)
-            `staticCompose`
-              decodeEnvPairStatic
+-- | Closure composition.
+closureCompose :: Closure (b -> c) -> Closure (a -> b) -> Closure (a -> c)
+closureCompose = G.closureCompose
 
--- | Closure composition
-closureCompose :: (Typeable a, Typeable b, Typeable c)
-               => Closure (b -> c) -> Closure (a -> b) -> Closure (a -> c)
-closureCompose g f = composeStatic `closureApplyStatic` g `closureApply` f
-
--- | Closure version of ('Arrow.***')
-closureSplit :: (Typeable a, Typeable a', Typeable b, Typeable b')
-             => Closure (a -> b) -> Closure (a' -> b') -> Closure ((a, a') -> (b, b'))
-closureSplit f g = splitStatic `closureApplyStatic` f `closureApply` g
+-- | Closure version of ('Arrow.***').
+closureSplit :: Closure (b -> c)
+             -> Closure (b' -> c')
+             -> Closure ((b, b') -> (c, c'))
+closureSplit = G.closureSplit
