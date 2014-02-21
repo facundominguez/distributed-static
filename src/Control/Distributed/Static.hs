@@ -192,22 +192,22 @@ import Data.Rank1Typeable
 -- Introducing static values                                                  --
 --------------------------------------------------------------------------------
 
-newtype StaticLabel = StaticLabel String
+newtype StringLabel = StringLabel String
   deriving (Typeable, Show)
 
 -- | A static value.
-type Static = G.Static StaticLabel
+type Static = G.Static StringLabel
 
-instance Binary StaticLabel where
-  put (StaticLabel label) = put label
-  get = StaticLabel <$> get
+instance Binary StringLabel where
+  put (StringLabel label) = put label
+  get = StringLabel <$> get
 
 -- | Create a primitive static value.
 --
 -- It is the responsibility of the client code to make sure the corresponding
 -- entry in the 'RemoteTable' has the appropriate type.
 staticLabel :: String -> Static a
-staticLabel = G.staticLabel . StaticLabel
+staticLabel = G.staticLabel . StringLabel
 
 -- | Apply a static value to another.
 staticApply :: Static (a -> b) -> Static a -> Static b
@@ -224,28 +224,28 @@ newtype RemoteTable = RemoteTable (Map String Dynamic)
 -- Predefined static labels                                                   --
 --------------------------------------------------------------------------------
 
-instance G.PreludeLabel StaticLabel where
-  constLabel   = StaticLabel "$const"
-  flipLabel    = StaticLabel "$flip"
+instance G.PreludeLabel StringLabel where
+  constLabel   = StringLabel "$const"
+  flipLabel    = StringLabel "$flip"
 
-instance G.CategoryLabel StaticLabel where
-  idLabel      = StaticLabel "$id"
-  composeLabel = StaticLabel "$compose"
+instance G.CategoryLabel StringLabel where
+  idLabel      = StringLabel "$id"
+  composeLabel = StringLabel "$compose"
 
-instance G.ArrowLabel StaticLabel where
-  firstLabel   = StaticLabel "$first"
-  secondLabel  = StaticLabel "$second"
-  splitLabel   = StaticLabel "$split"
-  fanoutLabel  = StaticLabel "$fanout"
+instance G.ArrowLabel StringLabel where
+  firstLabel   = StringLabel "$first"
+  secondLabel  = StringLabel "$second"
+  splitLabel   = StringLabel "$split"
+  fanoutLabel  = StringLabel "$fanout"
 
-instance G.ArrowApplyLabel StaticLabel where
-  appLabel     = StaticLabel "$app"
+instance G.ArrowApplyLabel StringLabel where
+  appLabel     = StringLabel "$app"
 
-instance G.BinaryLabel StaticLabel where
-  binaryDictEncodeLabel     = StaticLabel "$encode"
-  binaryDictDecodeLabel     = StaticLabel "$decode"
-  byteStringBinaryDictLabel = StaticLabel "$byteStringDict"
-  pairBinaryDictLabel       = StaticLabel "$pairDict"
+instance G.BinaryLabel StringLabel where
+  binaryDictEncodeLabel     = StringLabel "$encode"
+  binaryDictDecodeLabel     = StringLabel "$decode"
+  byteStringBinaryDictLabel = StringLabel "$byteStringDict"
+  pairBinaryDictLabel       = StringLabel "$pairDict"
 
 -- | Initial remote table
 initRemoteTable :: RemoteTable
@@ -292,8 +292,8 @@ registerStatic :: String -> Dynamic -> RemoteTable -> RemoteTable
 registerStatic label dyn (RemoteTable rtable) =
     RemoteTable (Map.insert label dyn rtable)
 
-instance G.Resolve StaticLabel Identity RemoteTable where
-  resolve (RemoteTable rtable) (StaticLabel label) =
+instance G.Resolve StringLabel Identity RemoteTable where
+  resolve (RemoteTable rtable) (StringLabel label) =
       case Map.lookup label rtable of
         Nothing -> return $ Left $ "Invalid static label '" ++ label ++ "'"
         Just d  -> return $ Right d
@@ -361,7 +361,7 @@ staticDecode = G.staticDecode
 -- Closures                                                                   --
 --------------------------------------------------------------------------------
 
-type Closure = G.Closure StaticLabel
+type Closure = G.Closure StringLabel
 
 closure :: Static (ByteString -> a) -- ^ Decoder
         -> ByteString               -- ^ Encoded closure environment
