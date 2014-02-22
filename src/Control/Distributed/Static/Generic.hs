@@ -75,7 +75,12 @@ module Control.Distributed.Static.Generic
   , Resolve(..)
   , unstatic
     -- * Static dictionaries
+#if MIN_VERSION_base(4,7,0)
   , Dict(..)
+  , BinaryDict
+#else
+  , BinaryDict(..)
+#endif
   , binaryDictEncode
   , binaryDictDecode
   , byteStringBinaryDict
@@ -125,9 +130,6 @@ import Control.Category (Category(..))
 import Control.Monad.Trans.Error (ErrorT(..))
 import Data.Rank1Dynamic (Dynamic, fromDynamic, dynApply)
 import Data.Typeable (Typeable)
-#if !MIN_VERSION_base(4,7,0)
-import Data.Typeable (typeOf, mkTyConApp, mkTyCon3)
-#endif
 import Prelude hiding ((.), id)
 
 --------------------------------------------------------------------------------
@@ -136,10 +138,10 @@ import Prelude hiding ((.), id)
 
 -- | A static value. 'Static' is opaque; see 'staticLabel' and 'staticApply' for
 -- ways to construct static values.
-data Static   :: * -> * -> * where
+data Static l a where
   -- Regular datatype, but use GADT syntax to make types more explicit.
   Static      :: l -> Static l a
-  StaticApply :: Static l (a -> b) -> Static l a -> Static l b
+  StaticApply :: Static l (b -> c) -> Static l b -> Static l c
   deriving (Typeable)
 
 -- Manual instance necessary due to non Haskell'98 datatype.
@@ -199,26 +201,37 @@ staticApply = StaticApply
 -- Internal wrappers                                                          --
 --------------------------------------------------------------------------------
 
+#if MIN_VERSION_base(4,7,0)
 -- | A reified type class dictionary. Useful for passing dictionaries explicitly.
-data Dict c = c => Dict
+data Dict c where
+  Dict :: c => Dict c
   deriving (Typeable)
 
 deriving instance Typeable Binary
 
+type BinaryDict a = Dict (Binary a)
+#else
+-- | Explicit 'Binary' dictionary. For GHC >= 7.8, this datatype is generalized
+-- to dictionaries of arbitrary constraints.
+data BinaryDict a where
+  Dict :: Binary a => BinaryDict a
+  deriving (Typeable)
+#endif
+
 -- | Version of 'encode' with an explicit dictionary.
-binaryDictEncode :: Dict (Binary a) -> a -> ByteString
+binaryDictEncode :: BinaryDict a -> a -> ByteString
 binaryDictEncode Dict = encode
 
 -- | Version of 'decode' with an explicit dictionary.
-binaryDictDecode :: Dict (Binary a) -> ByteString -> a
+binaryDictDecode :: BinaryDict a -> ByteString -> a
 binaryDictDecode Dict = decode
 
 -- | 'Binary' dictionary for 'ByteString's.
-byteStringBinaryDict :: Dict (Binary ByteString)
+byteStringBinaryDict :: BinaryDict ByteString
 byteStringBinaryDict = Dict
 
 -- | 'Binary' dictionary for pairs.
-pairBinaryDict :: Dict (Binary a) -> Dict (Binary b) -> Dict (Binary (a, b))
+pairBinaryDict :: BinaryDict a -> BinaryDict b -> BinaryDict (a, b)
 pairBinaryDict Dict Dict = Dict
 
 --------------------------------------------------------------------------------
@@ -313,23 +326,23 @@ staticApp = Static appLabel
 
 -- | Static version of ('encode').
 staticEncode :: (BinaryLabel l)
-             => Static l (Dict (Binary a))
+             => Static l (BinaryDict a)
              -> Static l (a -> ByteString)
 staticEncode dict = Static binaryDictEncodeLabel `staticApply` dict
 
 -- | Static version of ('decode').
 staticDecode :: (BinaryLabel l)
-             => Static l (Dict (Binary a))
+             => Static l (BinaryDict a)
              -> Static l (ByteString -> a)
 staticDecode dict = Static binaryDictDecodeLabel `staticApply` dict
 
-staticByteStringBinaryDict :: (BinaryLabel l) => Static l (Dict (Binary ByteString))
+staticByteStringBinaryDict :: (BinaryLabel l) => Static l (BinaryDict ByteString)
 staticByteStringBinaryDict = Static byteStringBinaryDictLabel
 
 staticPairBinaryDict :: (BinaryLabel l)
-                     => Static l (Dict (Binary a))
-                     -> Static l (Dict (Binary b))
-                     -> Static l (Dict (Binary (a, b)))
+                     => Static l (BinaryDict a)
+                     -> Static l (BinaryDict b)
+                     -> Static l (BinaryDict (a, b))
 staticPairBinaryDict dict1 dict2 =
     Static pairBinaryDictLabel `staticApply` dict1 `staticApply` dict2
 

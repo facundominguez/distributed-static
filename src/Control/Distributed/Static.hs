@@ -1,3 +1,5 @@
+{-# LANGUAGE CPP #-}
+
 -- | /Towards Haskell in the Cloud/ (Epstein et al, Haskell Symposium 2011)
 -- introduces the concept of /static/ values: values that are known at compile
 -- time. In a distributed setting where all nodes are running the same
@@ -134,7 +136,9 @@
 module Control.Distributed.Static
   ( -- * Static values
     Static
+#if MIN_VERSION_base(4,7,0)
   , Dict(..)
+#endif
   , staticLabel
   , staticApply
     -- * Derived static combinators
@@ -167,7 +171,14 @@ module Control.Distributed.Static
   ) where
 
 import qualified Control.Distributed.Static.Generic as G
-import Control.Distributed.Static.Generic (Dict(..))
+import Control.Distributed.Static.Generic
+#if MIN_VERSION_base(4,7,0)
+  ( Dict(..)
+  , BinaryDict
+  )
+#else
+  (BinaryDict(..))
+#endif
 import Data.Binary
   ( Binary(get, put)
   , encode
@@ -273,18 +284,18 @@ initRemoteTable =
     . registerStatic "$app"            (toDynamic (app    :: (ANY1 -> ANY2, ANY1)
                                                           -> ANY2))
     . registerStatic "$encode"         (toDynamic ((\Dict -> encode)
-                                                   :: Dict (Binary ANY1)
+                                                   :: BinaryDict ANY1
                                                    -> ANY1
                                                    -> ByteString))
     . registerStatic "$decode"         (toDynamic ((\Dict -> decode)
-                                                   :: Dict (Binary ANY1)
+                                                   :: BinaryDict ANY1
                                                    -> ByteString
                                                    -> ANY1))
-    . registerStatic "$byteStringDict" (toDynamic (Dict :: Dict (Binary ByteString)))
+    . registerStatic "$byteStringDict" (toDynamic (Dict :: BinaryDict ByteString))
     . registerStatic "$pairDict"       (toDynamic ((\Dict Dict -> Dict)
-                                                   :: Dict (Binary ANY1)
-                                                   -> Dict (Binary ANY2)
-                                                   -> Dict (Binary (ANY1, ANY2))))
+                                                   :: BinaryDict ANY1
+                                                   -> BinaryDict ANY2
+                                                   -> BinaryDict (ANY1, ANY2)))
     $ RemoteTable Map.empty
 
 -- | Register a static label
@@ -349,11 +360,11 @@ staticFanout = G.staticFanout
 staticApp :: Static ((b -> c, b) -> c)
 staticApp = G.staticApp
 
-staticEncode :: Static (Dict (Binary a))
+staticEncode :: Static (BinaryDict a)
              -> Static (a -> ByteString)
 staticEncode = G.staticEncode
 
-staticDecode :: Static (Dict (Binary a))
+staticDecode :: Static (BinaryDict a)
              -> Static (ByteString -> a)
 staticDecode = G.staticDecode
 
