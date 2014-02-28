@@ -1,6 +1,7 @@
 {-# LANGUAGE ImpredicativeTypes #-}
 {-# LANGUAGE MagicHash #-}
 {-# LANGUAGE StaticValues #-}
+{-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE UnboxedTuples #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
@@ -12,6 +13,8 @@ module Control.Distributed.StaticX
   , Dict(..)
   , staticLabel
   , staticApply
+  , mkStatic
+  , mkStaticT
     -- * Derived static combinators
   , staticConst
   , staticFlip
@@ -27,6 +30,8 @@ module Control.Distributed.StaticX
     -- * Closures
   , Closure
   , closure
+  , mkClosure
+  , mkClosureN
     -- * Derived closure combinators
   , staticClosure
   , closureApplyStatic
@@ -51,16 +56,22 @@ import Data.Binary
 import Data.ByteString.Lazy (ByteString)
 import Control.Applicative ((<$>), (<*>))
 import Control.Arrow as Arrow (Arrow(..), ArrowApply(..))
+import Control.Monad ( replicateM )
 import Control.Monad.IO.Class ( MonadIO(..) )
+import Data.List ( isPrefixOf )
 import Data.Rank1Dynamic ( toDynamic )
-import Data.Rank1Typeable ( Typeable, ANY )
+import Data.Rank1Typeable ( Typeable )
 
 import GHC.Exts         ( addrToAny# )
 import GHC.Ptr ( Ptr(..), nullPtr )
 import GHC.StaticRef
 import Foreign.C.String ( withCString, CString )
+import Language.Haskell.TH ( ExpQ, lamE, appE, varE, varP, newName, TypeQ, tupP
+                           , tupE
+                           )
 import Text.Encoding.Z ( zEncodeString )
 import System.Info ( os )
+import Unsafe.Coerce ( unsafeCoerce )
 
 
 --------------------------------------------------------------------------------
@@ -81,6 +92,17 @@ staticLabel = G.staticLabel . unStaticRef
 -- | Apply a static value to another.
 staticApply :: Static (a -> b) -> Static a -> Static b
 staticApply = G.staticApply
+
+-- | @$(mkStatic [| e :: t |]) :: StaticRef t@ being @Typeable t@.
+mkStatic :: ExpQ -> ExpQ
+mkStatic e = [| staticLabel $ static
+                 (unsafeCoerce (toDynamic $(e)) `asTypeOf` $(e))
+              |]
+
+mkStaticT :: ExpQ -> TypeQ -> ExpQ
+mkStaticT e t = [| staticLabel $ static
+                    (unsafeCoerce $ toDynamic $(e) :: $(t))
+                 |]
 
 --------------------------------------------------------------------------------
 -- Predefined static labels                                                   --
@@ -113,14 +135,16 @@ instance G.BinaryLabel GlobalName where
                                                    -> BinaryDict (a,b))
 
 instance MonadIO m => G.Resolve GlobalName m () where
-  resolve () gn@(GlobalName pkg _ m n) = do
+  resolve () gn@(GlobalName pkg _ m n) | "static:" `isPrefixOf` n = do
     let mpkg = case pkg of
                  "main" -> Nothing
                  _ -> Just pkg
-    mres <- liftIO (loadFunction__ mpkg m n :: IO (Maybe (forall a. a)))
+    mres <- liftIO $ loadFunction__ mpkg m n
     case mres of
-      Nothing -> return $ Left $ "Unknown static label '" ++ show gn ++ "'"
-      Just d  -> return $ Right $ toDynamic (d :: ANY)
+      Nothing -> return $ Left $ "resolve: Unknown static label '" ++ show gn ++ "'"
+      Just d  -> return $ Right d
+
+  resolve () gn = return $ Left $ "resolve: Unknown static label '" ++ show gn ++ "'"
 
 
 loadFunction__ :: Maybe String
@@ -218,6 +242,23 @@ unclosure = G.unclosure ()
 -- | Convert a static value into a closure.
 staticClosure :: Typeable a => Static a -> Closure a
 staticClosure = G.staticClosure
+
+-- | @unclosure ($(mkClosure n [| e |]) x1 ... xn) == e x1 ... xn@
+--
+-- > $(mkClosureN n e) = G.closure (\(x1,...,xn) -> e x1 ... xn) . decode) (encode (x1,...,xn))
+--
+mkClosureN :: Int -> ExpQ -> ExpQ
+mkClosureN n e = do
+    ns <- replicateM n $ newName "x"
+    let vs = map varE ns
+        ps = map varP ns
+    lamE ps [| G.closure $(mkStatic [| $(lamE [tupP ps] (foldl appE e vs)) . decode |])
+                         (encode $(tupE vs))
+            |]
+
+-- | @mkClosure = mkClosureN 1@
+mkClosure :: ExpQ -> ExpQ
+mkClosure = mkClosureN 1
 
 --------------------------------------------------------------------------------
 -- Combinators on Closures                                                    --

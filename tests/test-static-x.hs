@@ -1,4 +1,6 @@
+{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE StaticValues #-}
+{-# LANGUAGE TemplateHaskell #-}
 
 import Control.Distributed.StaticX
 import Control.Monad ( when )
@@ -12,12 +14,12 @@ string = "hello"
 
 main :: IO ()
 main = do
-    let sid0  = staticLabel $ static id
-        sid1  = staticLabel $ static (id . id)
-        sarg = staticLabel $ static string
+    let sid0 = $(mkStaticT [| id :: ANY -> ANY |] [t| forall a . a -> a |])
+        sid1 = $(mkStaticT [| id . id :: ANY -> ANY |] [t| forall a . a -> a |])
+        sarg = $(mkStatic [| string |])
 
     -- test that resolving the result of staticApply succeeds
-    either_s <- unstatic $ sid0 `staticApply` sid1 `staticApply` sarg
+    either_s <- unstatic $ sid0 `staticApply` (sid1 `staticApply` sarg)
     when (either_s /= Right string) $
       print either_s >> exitFailure
 
